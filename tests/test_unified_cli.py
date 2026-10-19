@@ -387,6 +387,15 @@ def test_predict_cli_writes_native_replay_telemetry_to_jsonl(tmp_path, capsys) -
             assert observed[key] == value, key
 
 
+def test_telemetry_interval_help_states_the_runner_default() -> None:
+    from aisimulate.cli_args import build_parser
+
+    predict = build_parser()._subparsers._group_actions[0].choices["predict"]
+    (action,) = [action for action in predict._actions if action.dest == "telemetry_interval_ms"]
+
+    assert f"(default: {ReplayOutputRequirements.telemetry_sample_interval_ms:g})" in action.help
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [

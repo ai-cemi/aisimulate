@@ -69,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_finite_float,
         default=None,
         metavar="MS",
+        # The default is ReplayOutputRequirements.telemetry_sample_interval_ms; it is
+        # restated because argument parsing must not import aisimulate.sweeper.
         help="virtual-time telemetry sample interval in ms; requires --capture-telemetry (default: 1000)",
     )
     subparsers.choices["predict"].epilog = (

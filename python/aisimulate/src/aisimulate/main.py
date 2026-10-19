@@ -189,7 +189,6 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         raise ValueError("analytical EPD cannot capture per-request records")
     if analytical_epd and args.capture_telemetry:
         raise ValueError("analytical EPD does not produce replay telemetry; remove --capture-telemetry")
-    telemetry_interval_ms = 1000.0 if args.telemetry_interval_ms is None else args.telemetry_interval_ms
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
     factory = _PredictionCliRunnerFactory(
         factory,
@@ -209,7 +208,11 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
             include_raw_report=not analytical_epd,
             capture_per_request=args.capture_per_request,
             capture_telemetry=args.capture_telemetry,
-            telemetry_sample_interval_ms=telemetry_interval_ms,
+            telemetry_sample_interval_ms=(
+                ReplayOutputRequirements.telemetry_sample_interval_ms
+                if args.telemetry_interval_ms is None
+                else args.telemetry_interval_ms
+            ),
             capture_memory_diagnostics="memory" in args.detail,
             capture_performance_diagnostics=bool({"time", "source"}.intersection(args.detail)),
         ),
