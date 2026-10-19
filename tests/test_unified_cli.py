@@ -405,8 +405,6 @@ def test_telemetry_interval_help_states_the_runner_default() -> None:
         (["--capture-telemetry", "--telemetry-interval-ms", "nan"], "must be finite and positive"),
         (["--capture-telemetry", "--telemetry-interval-ms", "inf"], "must be finite and positive"),
         (["--capture-telemetry", "--telemetry-interval-ms", "fast"], "invalid number"),
-        (["--capture-telemetry", "--online"], "--capture-telemetry requires offline --stack engine"),
-        (["--capture-telemetry", "--stack", "dynamo"], "--capture-telemetry requires offline --stack engine"),
     ],
 )
 @pytest.mark.parametrize("entrypoint", ["main", "supervision"])

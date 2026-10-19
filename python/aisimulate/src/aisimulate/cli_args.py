@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.choices["predict"].add_argument(
         "--capture-telemetry",
         action="store_true",
-        help="write virtual-time replay telemetry samples to telemetry.jsonl (offline --stack engine)",
+        help="write the selected stack's replay telemetry samples to telemetry.jsonl",
     )
     subparsers.choices["predict"].add_argument(
         "--telemetry-interval-ms",
@@ -127,8 +127,6 @@ def check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Na
         return
     if args.telemetry_interval_ms is not None and not args.capture_telemetry:
         parser.error("--telemetry-interval-ms requires --capture-telemetry")
-    if args.capture_telemetry and (args.stack != "engine" or args.online):
-        parser.error("--capture-telemetry requires offline --stack engine")
 
 
 def _load_mapping(path: str) -> dict[str, Any]:

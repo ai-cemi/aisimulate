@@ -46,7 +46,7 @@ illustrate the output format. Captured detail examples are simulation results, n
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
 | `--capture-per-request` | flag | `false` | Write per-request prediction records to `requests.jsonl`. |
-| `--capture-telemetry` | flag | `false` | Write virtual-time replay telemetry samples to `telemetry.jsonl`. Requires offline `--stack engine` native replay; AFD, analytical EPD, `--online` and other stacks are rejected. Per-request records do not change; worker-seconds and `gpu_hours` can differ in the last float bits. |
+| `--capture-telemetry` | flag | `false` | Write virtual-time replay telemetry samples to `telemetry.jsonl`. The selected stack must produce the samples: the built-in `engine` stack provides them for offline native replay and rejects AFD, analytical EPD and `--online`, and the run fails when a stack returns none. Per-request records do not change; worker-seconds and `gpu_hours` can differ in the last float bits. |
 | `--telemetry-interval-ms MS` | positive finite number | `1000` | Virtual-time interval between telemetry samples. Valid only with `--capture-telemetry`. |
 | `--detail` | comma-separated selectors | omitted | Add `summary`, `memory`, `time`, `energy`, `source`, or `all`. See [prediction details](#prediction-details). |
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
