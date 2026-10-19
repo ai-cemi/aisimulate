@@ -36,23 +36,29 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule};
 use serde::Deserialize;
 
+/// Tells the configured payload (a `spec` key) from a legacy bare `ReplaySpec`
+/// without buffering the document: every value is skipped unread.
+#[derive(Deserialize)]
+struct ExecutionPayloadProbe {
+    #[serde(default)]
+    spec: Option<serde::de::IgnoredAny>,
+}
+
+/// The configured execution payload. Parsed directly, so a malformed optional
+/// block reports its own field error instead of an untagged-variant mismatch.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ExecutionPayload {
-    Configured {
-        spec: ReplaySpec,
-        #[serde(default)]
-        traffic: Option<Box<RuntimeTraffic>>,
-        #[serde(default)]
-        capture_performance_diagnostics: bool,
-        #[serde(default)]
-        determinism: ReplayDeterminism,
-        #[serde(default)]
-        tokenization: Option<TokenizationPayload>,
-        #[serde(default)]
-        telemetry: Option<TelemetryPayload>,
-    },
-    Legacy(ReplaySpec),
+struct ConfiguredExecutionPayload {
+    spec: ReplaySpec,
+    #[serde(default)]
+    traffic: Option<Box<RuntimeTraffic>>,
+    #[serde(default)]
+    capture_performance_diagnostics: bool,
+    #[serde(default)]
+    determinism: ReplayDeterminism,
+    #[serde(default)]
+    tokenization: Option<TokenizationPayload>,
+    #[serde(default)]
+    telemetry: Option<TelemetryPayload>,
 }
 
 /// Optional virtual-time replay telemetry. `Replayer::with_telemetry_observer`
@@ -2686,23 +2692,29 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         determinism,
         tokenization,
         telemetry,
-    ) = match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
-        ExecutionPayload::Configured {
-            spec,
-            traffic,
-            capture_performance_diagnostics,
-            determinism,
-            tokenization,
-            telemetry,
-        } => (
-            spec,
-            traffic.map(|t| *t),
-            capture_performance_diagnostics,
-            determinism,
-            tokenization,
-            telemetry,
-        ),
-        ExecutionPayload::Legacy(spec) => {
+    ) = {
+        let probe: ExecutionPayloadProbe =
+            serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")?;
+        if probe.spec.is_some() {
+            let ConfiguredExecutionPayload {
+                spec,
+                traffic,
+                capture_performance_diagnostics,
+                determinism,
+                tokenization,
+                telemetry,
+            } = serde_json::from_str(payload).context("invalid AISimulate execution payload")?;
+            (
+                spec,
+                traffic.map(|t| *t),
+                capture_performance_diagnostics,
+                determinism,
+                tokenization,
+                telemetry,
+            )
+        } else {
+            let spec: ReplaySpec =
+                serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")?;
             (spec, None, false, ReplayDeterminism::default(), None, None)
         }
     };
@@ -6240,12 +6252,16 @@ mod tests {
                 "{error}"
             );
         }
-        for telemetry in [
-            serde_json::json!({}),
-            serde_json::json!({"sample_interval_ms": 1.0, "unknown": true}),
+        for (telemetry, expected) in [
+            (serde_json::json!({}), "missing field `sample_interval_ms`"),
+            (
+                serde_json::json!({"sample_interval_ms": 1.0, "unknown": true}),
+                "unknown field `unknown`",
+            ),
         ] {
             let payload = serde_json::json!({"spec": &spec, "telemetry": telemetry}).to_string();
-            assert!(execute_json(&payload, false).is_err(), "{telemetry}");
+            let error = format!("{:#}", execute_json(&payload, false).unwrap_err());
+            assert!(error.contains(expected), "{telemetry}: {error}");
         }
     }
 }
