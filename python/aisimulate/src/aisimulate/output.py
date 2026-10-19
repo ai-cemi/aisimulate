@@ -79,24 +79,24 @@ def write_fpm_coverage(root: Path, coverage: dict[str, Any]) -> Path:
     return path
 
 
-def write_requests(root: Path, records: list[dict[str, Any]]) -> Path:
-    path = root / "requests.jsonl"
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
+    """Write one compact JSON object per line, in the given order."""
+
     with path.open("w", encoding="utf-8") as output:
-        for record in records:
-            output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        for row in rows:
+            output.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
             output.write("\n")
     return path
+
+
+def write_requests(root: Path, records: list[dict[str, Any]]) -> Path:
+    return _write_jsonl(root / "requests.jsonl", records)
 
 
 def write_telemetry(root: Path, samples: list[dict[str, Any]]) -> Path:
     """Write replay telemetry samples, one snapshot per line in sample order."""
 
-    path = root / "telemetry.jsonl"
-    with path.open("w", encoding="utf-8") as output:
-        for sample in samples:
-            output.write(json.dumps(sample, sort_keys=True, separators=(",", ":")))
-            output.write("\n")
-    return path
+    return _write_jsonl(root / "telemetry.jsonl", samples)
 
 
 def write_recommendation_result(root: Path, result: SweepResult) -> Path:
