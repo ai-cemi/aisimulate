@@ -39,6 +39,7 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
             "recommendation.json",
             "recommendation.csv",
             "requests.jsonl",
+            "telemetry.jsonl",
             "resource-plan.json",
             "resource-runtime.json",
             "execution-events.jsonl",
@@ -83,6 +84,17 @@ def write_requests(root: Path, records: list[dict[str, Any]]) -> Path:
     with path.open("w", encoding="utf-8") as output:
         for record in records:
             output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            output.write("\n")
+    return path
+
+
+def write_telemetry(root: Path, samples: list[dict[str, Any]]) -> Path:
+    """Write replay telemetry samples, one snapshot per line in sample order."""
+
+    path = root / "telemetry.jsonl"
+    with path.open("w", encoding="utf-8") as output:
+        for sample in samples:
+            output.write(json.dumps(sample, sort_keys=True, separators=(",", ":")))
             output.write("\n")
     return path
 

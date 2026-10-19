@@ -295,6 +295,159 @@ def test_predict_is_the_single_concrete_cli(tmp_path, monkeypatch, capsys) -> No
     assert json.loads(capsys.readouterr().out)["completed_requests"] == 1
 
 
+def _fixed_timing_prediction_yaml(tmp_path):
+    worker = {
+        "scheduler": {"max_batched_tokens": 8192, "max_sequences": 4},
+        "kv_cache": {"block_size": 16, "prefix_caching": True, "capacity": {"type": "fixed", "blocks": 256}},
+        "timing": {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 1.0},
+    }
+    path = tmp_path / "prediction.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "engine": {
+                    "model": "example/model",
+                    "hardware": "h200_sxm",
+                    "backend": "vllm",
+                    "context_length": 4096,
+                    "workers": {"aggregated": worker},
+                }
+            }
+        )
+    )
+    return path
+
+
+def test_predict_cli_writes_native_replay_telemetry_to_jsonl(tmp_path, capsys) -> None:
+    config_path = _fixed_timing_prediction_yaml(tmp_path)
+    base = ["predict", "--config", str(config_path), "--format", "json", "--capture-per-request"]
+
+    assert cli.main([*base, "--output-dir", str(tmp_path / "plain")]) == 0
+    plain = json.loads(capsys.readouterr().out)
+    assert (
+        cli.main(
+            [
+                *base,
+                "--output-dir",
+                str(tmp_path / "observed"),
+                "--capture-telemetry",
+                "--telemetry-interval-ms",
+                "50",
+            ]
+        )
+        == 0
+    )
+    observed = json.loads(capsys.readouterr().out)
+
+    assert not (tmp_path / "plain" / "telemetry.jsonl").exists()
+    lines = (tmp_path / "observed" / "telemetry.jsonl").read_text().splitlines()
+    samples = [json.loads(line) for line in lines]
+    assert len(samples) > 2
+    assert samples[0]["kind"] == "baseline"
+    assert [sample["sample_ordinal"] for sample in samples] == list(range(len(samples)))
+    periodic = [sample for sample in samples if sample["kind"] == "periodic"]
+    assert periodic
+    assert all(sample["sampled_at_ms"] - sample["interval_start_ms"] == pytest.approx(50.0) for sample in periodic)
+    # Aggregated replay reports its single role in the decode rows.
+    assert samples[-1]["decode_scheduler_metrics"][0]["total_blocks"] == 256
+    requests = (tmp_path / "observed" / "requests.jsonl").read_text().splitlines()
+    assert sum(sample["traffic"]["arriving_requests"] for sample in samples) == len(requests)
+    assert sum(sample["traffic"]["completed_requests"] for sample in samples) == len(requests)
+
+    # The samples live only in telemetry.jsonl, and observing them changes no request record.
+    report = json.loads((tmp_path / "observed" / "prediction.json").read_text())
+    assert "telemetry" not in report
+
+    def records(name):
+        lines = (tmp_path / name / "requests.jsonl").read_text().splitlines()
+        # Request UUIDs (and the record order they set) are random unless
+        # canonical determinism is requested.
+        rows = [{key: value for key, value in json.loads(line).items() if key != "uuid"} for line in lines]
+        return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+
+    assert records("observed") == records("plain")
+    # Host wall-clock rates are not replay results.
+    skipped = {"wall_time_ms", "processed_tokens_per_s", "processed_output_tokens_per_s", "per_request"}
+    # Worker-seconds integrate at every clock advance, and each sample splits that
+    # integration, so they (and gpu_hours, derived from them) can differ in the last
+    # float bits. Same tolerance as telemetry_sampling_does_not_perturb_the_replay_report
+    # (crates/core/tests/runtime_contract.rs).
+    time_integrated = {"decode_worker_seconds", "prefill_worker_seconds", "gpu_hours"}
+    assert observed.keys() == plain.keys()
+    for key, value in plain.items():
+        if key in skipped:
+            continue
+        if key in time_integrated:
+            assert observed[key] == pytest.approx(value, rel=0.0, abs=1e-12), key
+        elif key.startswith(("mean_", "std_")):
+            # Means and standard deviations sum the request records in UUID order,
+            # which is random, so two plain runs also differ in the last float bits.
+            assert observed[key] == pytest.approx(value, rel=1e-12, abs=0.0), key
+        else:
+            assert observed[key] == value, key
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--telemetry-interval-ms", "100"], "--telemetry-interval-ms requires --capture-telemetry"),
+        (["--capture-telemetry", "--telemetry-interval-ms", "0"], "must be finite and positive"),
+        (["--capture-telemetry", "--telemetry-interval-ms", "-5"], "must be finite and positive"),
+        (["--capture-telemetry", "--telemetry-interval-ms", "nan"], "must be finite and positive"),
+        (["--capture-telemetry", "--telemetry-interval-ms", "inf"], "must be finite and positive"),
+        (["--capture-telemetry", "--telemetry-interval-ms", "fast"], "invalid number"),
+        (["--capture-telemetry", "--online"], "--capture-telemetry requires offline --stack engine"),
+        (["--capture-telemetry", "--stack", "dynamo"], "--capture-telemetry requires offline --stack engine"),
+    ],
+)
+@pytest.mark.parametrize("entrypoint", ["main", "supervision"])
+def test_predict_cli_rejects_invalid_telemetry_options_before_touching_outputs(
+    tmp_path, monkeypatch, capsys, arguments, message, entrypoint
+) -> None:
+    import aisimulate.supervision as supervision
+
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "telemetry.jsonl").write_text("old")
+    monkeypatch.setattr(cli, "resolve_runner_factory", lambda stack: pytest.fail("stack must not be resolved"))
+    main = cli.main if entrypoint == "main" else supervision.main
+
+    with pytest.raises(SystemExit) as error:
+        main(["predict", "--config", "unused.yaml", "--output-dir", str(output), "--overwrite", *arguments])
+
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+    assert (output / "telemetry.jsonl").read_text() == "old"
+
+
+def test_predict_cli_fails_loudly_when_the_stack_returns_no_telemetry(tmp_path, monkeypatch, capsys) -> None:
+    config_path = tmp_path / "prediction.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "engine": {
+                    "model": "example/model",
+                    "hardware": "h200_sxm",
+                    "context_length": 4096,
+                    "workers": {"aggregated": {}},
+                }
+            }
+        )
+    )
+    runner = _Runner()
+    monkeypatch.setattr(cli, "resolve_runner_factory", lambda stack: _Factory(runner))
+
+    status = cli.main(
+        ["predict", "--config", str(config_path), "--output-dir", str(tmp_path / "out"), "--capture-telemetry"]
+    )
+
+    assert status == 1
+    assert runner.output_requirements.capture_telemetry is True
+    assert runner.output_requirements.telemetry_sample_interval_ms == 1000.0
+    assert "selected stack did not provide replay telemetry samples" in capsys.readouterr().err
+    assert not (tmp_path / "out" / "telemetry.jsonl").exists()
+
+
 def _prediction_config() -> CorePredictionConfig:
     return CorePredictionConfig.model_validate(
         {
@@ -1659,6 +1812,7 @@ def test_overwrite_only_removes_known_outputs(tmp_path) -> None:
     (root / "recommendation.csv").write_text("old")
     (root / "afd-replay-spec.json").write_text("old")
     (root / "afd-qualification.json").write_text("old")
+    (root / "telemetry.jsonl").write_text("old")
     (recommendations / "0001.yaml").write_text("old")
     (recommendations / "notes.txt").write_text("keep")
 
@@ -1674,6 +1828,7 @@ def test_overwrite_only_removes_known_outputs(tmp_path) -> None:
     assert not (root / "recommendation.csv").exists()
     assert not (root / "afd-replay-spec.json").exists()
     assert not (root / "afd-qualification.json").exists()
+    assert not (root / "telemetry.jsonl").exists()
     assert not (recommendations / "0001.yaml").exists()
 
 

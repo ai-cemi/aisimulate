@@ -474,8 +474,15 @@ class EngineReplayRunner:
             spec.backend_deployment.deployment_mode in {"afd", "afd+pd"} or spec.backend_deployment.encoder is not None
         ):
             raise InvalidRunnerError("canonical determinism requires native text replay")
-        if output_requirements.capture_telemetry:
-            raise InvalidRunnerError("EngineReplayRunner's JSON runtime does not yet expose replay telemetry")
+        if output_requirements.capture_telemetry and (
+            spec.execution_mode != "offline"
+            or spec.backend_deployment.deployment_mode in {"afd", "afd+pd"}
+            or (spec.backend_deployment.encoder is not None and spec.backend_deployment.encoder.mode == "analytical")
+        ):
+            raise InvalidRunnerError(
+                "replay telemetry requires offline native replay; AFD, analytical EPD and online "
+                "execution do not produce replay telemetry samples"
+            )
         if spec.workload.get("source_type") is not None and "length_sampler" in spec.workload:
             raise ValueError("length_sampler requires materialized direct synthetic replay without source_type")
         self.capabilities.require_compatible(spec)
@@ -587,6 +594,12 @@ class EngineReplayRunner:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
             execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
+        if output_requirements.capture_telemetry:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["telemetry"] = {
+                "sample_interval_ms": float(output_requirements.telemetry_sample_interval_ms),
+            }
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -637,6 +650,7 @@ class EngineReplayRunner:
             include_native_report=(
                 output_requirements.include_raw_report
                 or output_requirements.capture_per_request
+                or output_requirements.capture_telemetry
                 or output_requirements.capture_memory_diagnostics
                 or output_requirements.capture_performance_diagnostics
             ),

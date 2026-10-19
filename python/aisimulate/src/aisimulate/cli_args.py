@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,16 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
 
 
@@ -48,6 +59,18 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--overwrite", action="store_true")
         child.add_argument("--format", choices=("table", "json"), default="table")
     subparsers.choices["predict"].add_argument("--capture-per-request", action="store_true")
+    subparsers.choices["predict"].add_argument(
+        "--capture-telemetry",
+        action="store_true",
+        help="write virtual-time replay telemetry samples to telemetry.jsonl (offline --stack engine)",
+    )
+    subparsers.choices["predict"].add_argument(
+        "--telemetry-interval-ms",
+        type=_positive_finite_float,
+        default=None,
+        metavar="MS",
+        help="virtual-time telemetry sample interval in ms; requires --capture-telemetry (default: 1000)",
+    )
     subparsers.choices["predict"].epilog = (
         "AgentX replay: use weka, agentic_mooncake, or agentic Dynamo traces with "
         "trace_timestamps and positive agentic_lanes. The offline engine stack supports "
@@ -93,6 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_support_parser(subparsers)
     return parser
+
+
+def check_option_combinations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject option combinations before any output file is touched."""
+
+    if args.command != "predict":
+        return
+    if args.telemetry_interval_ms is not None and not args.capture_telemetry:
+        parser.error("--telemetry-interval-ms requires --capture-telemetry")
+    if args.capture_telemetry and (args.stack != "engine" or args.online):
+        parser.error("--capture-telemetry requires offline --stack engine")
 
 
 def _load_mapping(path: str) -> dict[str, Any]:

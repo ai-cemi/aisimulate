@@ -124,8 +124,13 @@ and neutral observation contracts.
 interval and returns `ReplayResult<Self>`. The observer receives a baseline,
 settled interval samples, and a final tail when needed. A sample coinciding
 with a scaling tick observes settled pre-scaling state. Grouped cache byte
-occupancy is available here even though the Python JSON runner does not expose
-this observer API. Telemetry neither extends the time cap nor prevents deadlock.
+occupancy is available here. The Python JSON runner exposes the same observer
+through an optional execution-payload field
+`telemetry: {"sample_interval_ms": <finite, positive>}`; the report then gets a
+`telemetry` list of serialized `ReplayTelemetrySnapshot` values in sample order.
+Without the field, the report and the replay are unchanged.
+`aisimulate predict --capture-telemetry` writes these samples to
+`telemetry.jsonl`. Telemetry neither extends the time cap nor prevents deadlock.
 
 ## Errors and stability
 

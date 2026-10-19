@@ -100,8 +100,11 @@ and limitations rather than substituting zero for unavailable measurements.
 
 `ReplayOutputRequirements` defaults to summary output and can request raw,
 per-request, telemetry, memory or timing diagnostics. A runner must reject
-unsupported capture combinations. The Engine JSON runner rejects telemetry
-capture even though native Rust observers support it.
+unsupported capture combinations. The Engine JSON runner supports telemetry
+capture for offline native replay and returns the samples in
+`metadata["native_report"]["telemetry"]`;
+AFD, analytical EPD and online execution reject it. The CLI, not the runner,
+writes them to `telemetry.jsonl`.
 
 An optional `estimate_host_resources(workload, *, concurrency=None)` factory
 method participates in [resource admission](../reference/local-resources.md).

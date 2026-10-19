@@ -16,7 +16,14 @@ from typing import Any
 from pydantic import ValidationError
 
 from .afd_artifacts import write_afd_qualification_artifacts
-from .cli_args import _apply_overrides, _CliConfigError, _extract_output_configs, _load_mapping, build_parser
+from .cli_args import (
+    _apply_overrides,
+    _CliConfigError,
+    _extract_output_configs,
+    _load_mapping,
+    build_parser,
+    check_option_combinations,
+)
 from .config.cli import (
     CorePredictionConfig,
     CoreRecommendationConfig,
@@ -41,6 +48,7 @@ from .output import (
     write_recommendation_result,
     write_recommendations,
     write_requests,
+    write_telemetry,
 )
 from .output_adapter import (
     OutputAdapterExecutionError,
@@ -179,6 +187,9 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     analytical_epd = encoder is not None and encoder.mode == "analytical"
     if analytical_epd and args.capture_per_request:
         raise ValueError("analytical EPD cannot capture per-request records")
+    if analytical_epd and args.capture_telemetry:
+        raise ValueError("analytical EPD does not produce replay telemetry; remove --capture-telemetry")
+    telemetry_interval_ms = 1000.0 if args.telemetry_interval_ms is None else args.telemetry_interval_ms
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
     factory = _PredictionCliRunnerFactory(
         factory,
@@ -197,6 +208,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         output_requirements=ReplayOutputRequirements(
             include_raw_report=not analytical_epd,
             capture_per_request=args.capture_per_request,
+            capture_telemetry=args.capture_telemetry,
+            telemetry_sample_interval_ms=telemetry_interval_ms,
             capture_memory_diagnostics="memory" in args.detail,
             capture_performance_diagnostics=bool({"time", "source"}.intersection(args.detail)),
         ),
@@ -207,6 +220,15 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     spec = result.replay_spec
     summary = result.summary
     native = result.native
+    telemetry = None
+    if args.capture_telemetry:
+        # Samples go to telemetry.jsonl only; prediction.json keeps its existing shape.
+        telemetry = native.get("telemetry")
+        if not isinstance(telemetry, list):
+            raise RuntimeError("selected stack did not provide replay telemetry samples")
+        if any(not isinstance(sample, dict) for sample in telemetry):
+            raise RuntimeError("replay telemetry samples must be JSON mappings")
+        native = {key: value for key, value in native.items() if key != "telemetry"}
     if isinstance(native.get("fpm_query_coverage"), dict):
         write_fpm_coverage(root, native["fpm_query_coverage"])
     power_diagnostics = None
@@ -239,6 +261,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         if any(not isinstance(record, dict) for record in records):
             raise RuntimeError("per-request records must be JSON mappings")
         write_requests(root, records)
+    if telemetry is not None:
+        write_telemetry(root, telemetry)
     phases = result.report.metadata.get("agentic_phases")
     if isinstance(phases, dict) and phases.get("phase") == "aborted":
         sys.stderr.write(
@@ -408,6 +432,7 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    check_option_combinations(parser, args)
     if args.command == "onboard":
         try:
             return run_support_command(args)

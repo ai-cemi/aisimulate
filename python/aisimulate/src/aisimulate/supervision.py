@@ -386,12 +386,19 @@ def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) ->
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from .cli_args import _apply_overrides, _extract_output_configs, _load_mapping, build_parser
+    from .cli_args import (
+        _apply_overrides,
+        _extract_output_configs,
+        _load_mapping,
+        build_parser,
+        check_option_combinations,
+    )
     from .output import prepare_output_directory
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    check_option_combinations(parser, args)
     if args.command == "onboard":
         from .support.cli import run_support_command
 
@@ -440,6 +447,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ValueError("encoder pools require offline --stack engine without adapters")
                 if args.command == "predict" and encoder.mode == "analytical" and args.capture_per_request:
                     raise ValueError("analytical EPD cannot capture per-request records")
+                if args.command == "predict" and encoder.mode == "analytical" and args.capture_telemetry:
+                    raise ValueError("analytical EPD does not produce replay telemetry; remove --capture-telemetry")
                 if args.command == "recommend" and (args.stack != "engine" or adapter_raw):
                     raise ValueError("encoder pools require --stack engine without adapters")
         except (ValueError, TypeError, AttributeError) as exc:

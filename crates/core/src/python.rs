@@ -16,7 +16,8 @@ use crate::replay::{
     EncoderSpec, POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
     ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory,
     ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
-    ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
+    ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTelemetryObserver,
+    ReplayTelemetrySnapshot, ReplayTopology, Replayer, TracePowerStats,
     loadgen::{
         AgenticProfileOptions, AgenticSnapshotOptions, AgenticWarmupPolicy, ArrivalSpec, DelaySpec,
         DynamoRequestTrace, LengthSpec, SyntheticImages, SyntheticTraceSpec, Trace,
@@ -48,8 +49,31 @@ enum ExecutionPayload {
         determinism: ReplayDeterminism,
         #[serde(default)]
         tokenization: Option<TokenizationPayload>,
+        #[serde(default)]
+        telemetry: Option<TelemetryPayload>,
     },
     Legacy(ReplaySpec),
+}
+
+/// Optional virtual-time replay telemetry. `Replayer::with_telemetry_observer`
+/// validates the interval.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelemetryPayload {
+    sample_interval_ms: f64,
+}
+
+/// Keeps every sample in order for the report's `telemetry` list.
+struct CollectedTelemetry(Arc<Mutex<Vec<ReplayTelemetrySnapshot>>>);
+
+impl ReplayTelemetryObserver for CollectedTelemetry {
+    fn on_sample(&mut self, snapshot: ReplayTelemetrySnapshot) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow!("replay telemetry collector lock was poisoned"))?
+            .push(snapshot);
+        Ok(())
+    }
 }
 
 /// Per-worker tokenization applied between placement and the engine.
@@ -2121,7 +2145,8 @@ fn run_with_input(
     capture_artifacts: bool,
     determinism: ReplayDeterminism,
     tokenization: Option<TokenizationPayload>,
-) -> crate::replay::ReplayResult<(crate::replay::ReplayReport, Option<ReplayArtifacts>)> {
+    telemetry: Option<TelemetryPayload>,
+) -> crate::replay::ReplayResult<ReplayOutcome> {
     let mut replayer = match input {
         Some(input) => Replayer::new(spec, factory)?.with_runtime_input(input),
         None => Replayer::new(spec, factory)?,
@@ -2137,13 +2162,51 @@ fn run_with_input(
             tokenization.per_input_token_ms,
         )?;
     }
-    if capture_artifacts {
+    // Without the payload field no observer is attached, so the replay keeps
+    // its telemetry-free path.
+    let samples = match telemetry {
+        Some(telemetry) => {
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            replayer = replayer.with_telemetry_observer(
+                telemetry.sample_interval_ms,
+                Box::new(CollectedTelemetry(Arc::clone(&samples))),
+            )?;
+            Some(samples)
+        }
+        None => None,
+    };
+    let (report, artifacts) = if capture_artifacts {
         let (report, artifacts) =
             replayer.run_with_artifacts(ReplayArtifactKvEventVisibility::Native)?;
-        Ok((report, Some(artifacts)))
+        (report, Some(artifacts))
     } else {
-        Ok((replayer.run()?, None))
-    }
+        (replayer.run()?, None)
+    };
+    let telemetry = samples
+        .map(|samples| {
+            samples
+                .lock()
+                .map(|mut samples| std::mem::take(&mut *samples))
+                .map_err(|_| {
+                    crate::replay::ReplayError::Telemetry(
+                        "replay telemetry collector lock was poisoned".to_string(),
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(ReplayOutcome {
+        report,
+        artifacts,
+        telemetry,
+    })
+}
+
+/// One replay's report plus its optional detail captures.
+struct ReplayOutcome {
+    report: crate::replay::ReplayReport,
+    artifacts: Option<ReplayArtifacts>,
+    /// Samples in sample order; `None` when telemetry was not requested.
+    telemetry: Option<Vec<ReplayTelemetrySnapshot>>,
 }
 
 struct TimingPowerSource {
@@ -2616,25 +2679,33 @@ fn replay_fpm_coverage(
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    let (mut spec, mut traffic, capture_performance_diagnostics, determinism, tokenization) =
-        match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
-            ExecutionPayload::Configured {
-                spec,
-                traffic,
-                capture_performance_diagnostics,
-                determinism,
-                tokenization,
-            } => (
-                spec,
-                traffic.map(|t| *t),
-                capture_performance_diagnostics,
-                determinism,
-                tokenization,
-            ),
-            ExecutionPayload::Legacy(spec) => {
-                (spec, None, false, ReplayDeterminism::default(), None)
-            }
-        };
+    let (
+        mut spec,
+        mut traffic,
+        capture_performance_diagnostics,
+        determinism,
+        tokenization,
+        telemetry,
+    ) = match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
+        ExecutionPayload::Configured {
+            spec,
+            traffic,
+            capture_performance_diagnostics,
+            determinism,
+            tokenization,
+            telemetry,
+        } => (
+            spec,
+            traffic.map(|t| *t),
+            capture_performance_diagnostics,
+            determinism,
+            tokenization,
+            telemetry,
+        ),
+        ExecutionPayload::Legacy(spec) => {
+            (spec, None, false, ReplayDeterminism::default(), None, None)
+        }
+    };
     ensure!(
         spec.max_sim_time_ms.is_none()
             || traffic
@@ -2764,8 +2835,16 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             if let Some(timing) = &encoder_timing {
                 factory = factory.with_encoder_timing(Arc::clone(timing));
             }
-            run_with_input(spec, factory, input, capture_artifacts, determinism, tokenization)
-                .map(|(report, artifacts)| (report, artifacts, resolved_basis))
+            run_with_input(
+                spec,
+                factory,
+                input,
+                capture_artifacts,
+                determinism,
+                tokenization,
+                telemetry,
+            )
+            .map(|outcome| (outcome, resolved_basis))
         }
         ReplayTopology::Disaggregated { .. } => {
             let mut prefill = engine_config
@@ -2884,14 +2963,29 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             if let Some(timing) = &encoder_timing {
                 factory = factory.with_encoder_timing(Arc::clone(timing));
             }
-            run_with_input(spec, factory, input, capture_artifacts, determinism, tokenization)
-            .map(|(report, artifacts)| (report, artifacts, resolved_basis))
+            run_with_input(
+                spec,
+                factory,
+                input,
+                capture_artifacts,
+                determinism,
+                tokenization,
+                telemetry,
+            )
+            .map(|outcome| (outcome, resolved_basis))
         }
         }
         .map_err(Into::into)
     })()
     .context("AISimulate replay failed");
-    let (mut report, artifacts, resolved_weka_timestamp_basis) = match replay_result {
+    let (
+        ReplayOutcome {
+            mut report,
+            artifacts,
+            telemetry: telemetry_samples,
+        },
+        resolved_weka_timestamp_basis,
+    ) = match replay_result {
         Ok(result) => result,
         Err(error) => {
             return Err(replay_failure(
@@ -2988,9 +3082,17 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             .context("AISimulate replay report did not serialize as an object")?
             .insert("per_request".to_string(), serde_json::Value::Null);
     }
+    if telemetry_samples.is_some() {
+        // Holds the key's place; the samples are serialized there directly.
+        report_json
+            .as_object_mut()
+            .context("AISimulate replay report did not serialize as an object")?
+            .insert("telemetry".to_string(), serde_json::Value::Null);
+    }
     let report_json = ReportWithRecords {
         report: &report_json,
         records: &report.per_request,
+        telemetry: telemetry_samples.as_deref(),
     };
     if let Some(artifacts) = artifacts {
         let output = serde_json::json!({
@@ -3005,10 +3107,12 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
 /// The report object with its `per_request` placeholder serialized as the
 /// records, each converted to `Value` on its own. The output equals inserting
 /// `serde_json::to_value(records)` and serializing the whole `Value`, without a
-/// `Value` tree for every record at once.
+/// `Value` tree for every record at once. A requested `telemetry` placeholder
+/// is serialized as the samples, in sample order, without a `Value` tree.
 struct ReportWithRecords<'a> {
     report: &'a serde_json::Value,
     records: &'a [crate::replay::PerRequestRecord],
+    telemetry: Option<&'a [ReplayTelemetrySnapshot]>,
 }
 
 impl serde::Serialize for ReportWithRecords<'_> {
@@ -3025,6 +3129,10 @@ impl serde::Serialize for ReportWithRecords<'_> {
         for (key, value) in object {
             if key == "per_request" {
                 map.serialize_entry(key, &RecordValues(self.records))?;
+            } else if key == "telemetry"
+                && let Some(samples) = self.telemetry
+            {
+                map.serialize_entry(key, samples)?;
             } else {
                 map.serialize_entry(key, value)?;
             }
@@ -5914,6 +6022,7 @@ mod tests {
         let streamed = ReportWithRecords {
             report: &summary,
             records: &replayed.per_request,
+            telemetry: None,
         };
         assert_eq!(
             serde_json::to_string(&streamed).unwrap(),
@@ -5957,6 +6066,186 @@ mod tests {
                     assert!(report.get("per_request").is_none());
                 }
             }
+        }
+    }
+
+    fn telemetry_test_spec() -> ReplaySpec {
+        ReplaySpec {
+            version: 1,
+            encoder: None,
+            topology: ReplayTopology::Aggregated {
+                workers: WorkerPoolSpec::default(),
+            },
+            engine: serde_json::to_value(ReplayEngineConfig {
+                rank: EngineConfig {
+                    num_gpu_blocks: 16,
+                    block_size: 4,
+                    max_num_seqs: 4,
+                    max_num_batched_tokens: 64,
+                    timing_model: TimingModelConfig::Fixed {
+                        prefill_ms: 1.0,
+                        decode_ms: 1.0,
+                    },
+                    ..EngineConfig::default()
+                },
+                ..ReplayEngineConfig::default()
+            })
+            .unwrap(),
+            adapters: ReplayAdapters {
+                placement: ProviderSpec::round_robin(),
+                scaling: ProviderSpec::no_scaling(),
+            },
+            max_sim_time_ms: None,
+            max_in_flight: None,
+            record_per_request: true,
+            sla: Default::default(),
+            requests: (0..4)
+                .map(|index| ReplayRequest {
+                    id: format!("request-{index}"),
+                    arrival_time_ms: 3.0 * index as f64,
+                    input_tokens: 8,
+                    input_token_ids: None,
+                    output_tokens: 3,
+                    output_token_ids: None,
+                    dp_rank: None,
+                    prefill_dp_rank: None,
+                    kv_hints: None,
+                    session_id: None,
+                    turn_index: None,
+                    metadata: serde_json::Value::Null,
+                })
+                .collect(),
+        }
+    }
+
+    /// Drop the host-timed fields that `CANONICAL_RESULT_EXCLUSIONS` names.
+    fn without_host_timing(mut report: serde_json::Value) -> serde_json::Value {
+        let object = report.as_object_mut().unwrap();
+        for key in [
+            "wall_time_ms",
+            "processed_tokens_per_s",
+            "processed_output_tokens_per_s",
+        ] {
+            object.remove(key).expect("report carries host-timed field");
+        }
+        report
+    }
+
+    #[test]
+    fn json_runtime_returns_requested_telemetry_without_changing_the_replay() {
+        struct Collect(Arc<Mutex<Vec<ReplayTelemetrySnapshot>>>);
+        impl ReplayTelemetryObserver for Collect {
+            fn on_sample(&mut self, snapshot: ReplayTelemetrySnapshot) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(snapshot);
+                Ok(())
+            }
+        }
+
+        let spec = telemetry_test_spec();
+        // Canonical request IDs make two replays comparable field by field.
+        let baseline_payload =
+            serde_json::json!({"spec": &spec, "determinism": "canonical_v1"}).to_string();
+        let with_telemetry = serde_json::json!({
+            "spec": &spec,
+            "determinism": "canonical_v1",
+            "telemetry": {"sample_interval_ms": 2.0},
+        })
+        .to_string();
+
+        let legacy: serde_json::Value = serde_json::from_str(
+            &execute_json(&serde_json::to_string(&spec).unwrap(), false).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.get("telemetry").is_none());
+        let baseline: serde_json::Value =
+            serde_json::from_str(&execute_json(&baseline_payload, false).unwrap()).unwrap();
+        assert!(baseline.get("telemetry").is_none());
+
+        let mut observed: serde_json::Value =
+            serde_json::from_str(&execute_json(&with_telemetry, false).unwrap()).unwrap();
+        let telemetry = observed
+            .as_object_mut()
+            .unwrap()
+            .remove("telemetry")
+            .expect("requested telemetry is reported");
+        // Telemetry is observational. Sampling splits the resource integrals into
+        // more floating-point additions, so compare them within 1e-12 (as
+        // telemetry_sampling_does_not_perturb_the_replay_report does) and every
+        // other report field exactly.
+        let mut observed = without_host_timing(observed);
+        let baseline = without_host_timing(baseline);
+        for key in [
+            "decode_worker_seconds",
+            "prefill_worker_seconds",
+            "gpu_hours",
+        ] {
+            let expected = baseline[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("baseline has {key}"));
+            let actual = observed[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("observed has {key}"));
+            assert!(
+                (expected - actual).abs() < 1e-12,
+                "{key}: {expected} != {actual}"
+            );
+            observed[key] = baseline[key].clone();
+        }
+        assert_eq!(observed, baseline);
+
+        // The JSON list is the direct observer's samples, in sample order.
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        Replayer::new(spec.clone(), ReplayEngineFactory::new())
+            .unwrap()
+            .with_capture_options(ReplayCaptureOptions {
+                determinism: ReplayDeterminism::CanonicalV1,
+                ..ReplayCaptureOptions::default()
+            })
+            .with_telemetry_observer(2.0, Box::new(Collect(Arc::clone(&samples))))
+            .unwrap()
+            .run()
+            .unwrap();
+        let direct = serde_json::to_value(&*samples.lock().unwrap()).unwrap();
+        assert_eq!(telemetry, direct);
+        let telemetry = telemetry.as_array().unwrap();
+        assert!(
+            telemetry.len() > 3,
+            "expected several samples, got {telemetry:?}"
+        );
+        assert_eq!(telemetry[0]["kind"], "baseline");
+        for (ordinal, sample) in telemetry.iter().enumerate() {
+            assert_eq!(sample["sample_ordinal"], ordinal as u64);
+        }
+        let arrivals: u64 = telemetry
+            .iter()
+            .map(|sample| sample["traffic"]["arriving_requests"].as_u64().unwrap())
+            .sum();
+        assert_eq!(arrivals, 4);
+
+        let captured: serde_json::Value =
+            serde_json::from_str(&execute_json(&with_telemetry, true).unwrap()).unwrap();
+        assert_eq!(captured["report"]["telemetry"], direct);
+    }
+
+    #[test]
+    fn json_runtime_rejects_invalid_telemetry_requests() {
+        let spec = telemetry_test_spec();
+        for interval in [0.0, -1.0] {
+            let payload =
+                serde_json::json!({"spec": &spec, "telemetry": {"sample_interval_ms": interval}})
+                    .to_string();
+            let error = format!("{:#}", execute_json(&payload, false).unwrap_err());
+            assert!(
+                error.contains("telemetry sample interval must be finite and positive"),
+                "{error}"
+            );
+        }
+        for telemetry in [
+            serde_json::json!({}),
+            serde_json::json!({"sample_interval_ms": 1.0, "unknown": true}),
+        ] {
+            let payload = serde_json::json!({"spec": &spec, "telemetry": telemetry}).to_string();
+            assert!(execute_json(&payload, false).is_err(), "{telemetry}");
         }
     }
 }

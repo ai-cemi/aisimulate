@@ -356,6 +356,19 @@ def test_cli_rejects_unsupported_outputs_before_touching_output(tmp_path, capsys
     assert sentinel.read_text() == "keep me"
 
 
+def test_cli_rejects_epd_telemetry_before_touching_output(tmp_path, capsys):
+    path = tmp_path / "prediction.yaml"
+    path.write_text(yaml.safe_dump(_prediction()))
+    output = tmp_path / "existing"
+    output.mkdir()
+    sentinel = output / "prediction.json"
+    sentinel.write_text("keep me")
+    with pytest.raises(SystemExit, match="2"):
+        main(["predict", "-c", str(path), "--output-dir", str(output), "--overwrite", "--capture-telemetry"])
+    assert "analytical EPD does not produce replay telemetry" in capsys.readouterr().err
+    assert sentinel.read_text() == "keep me"
+
+
 def test_context_limit_includes_visual_tokens():
     raw = _prediction()
     raw["engine"]["context_length"] = 140

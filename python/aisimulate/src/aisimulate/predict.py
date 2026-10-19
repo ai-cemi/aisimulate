@@ -133,6 +133,7 @@ def run_prediction(
     retain_native_report = (
         output_requirements.include_raw_report
         or output_requirements.capture_per_request
+        or output_requirements.capture_telemetry
         or capture_memory_details
         or output_requirements.capture_performance_diagnostics
     )
