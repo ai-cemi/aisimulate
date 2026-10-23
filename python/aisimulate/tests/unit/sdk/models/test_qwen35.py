@@ -582,3 +582,89 @@ def test_qwen38max_memory_charges_kv_on_full_layers_and_constant_gdn_state(
     per_token_bytes = 2 * expected_elements_per_token  # bf16 kvcache
     assert model.get_kvcache_bytes_per_sequence(4096) == 4096 * per_token_bytes + expected_state_bytes
     assert model.get_kvcache_max_tokens(expected_state_bytes + 100 * per_token_bytes) == 100
+
+
+# Synthetic checkpoint metadata keeps these regression tests offline.
+@pytest.fixture
+def qwen_precision_model(tmp_path):
+    from aisimulate_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    def build(exclusions=(), *, override=None, moe=False):
+        name = "Qwen/Qwen3.5-35B-A3B" if moe else "Qwen/Qwen3.5-27B"
+        raw = copy.deepcopy(_load_pre_downloaded_hf_config(name))
+        raw["quantization_config"] = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": list(exclusions),
+        }
+        # Unique paths avoid the process-local model-config cache.
+        folder = tmp_path / str(len(list(tmp_path.iterdir())))
+        folder.mkdir()
+        (folder / "config.json").write_text(json.dumps(raw))
+        cfg = sdk_config.ModelConfig(tp_size=2, moe_tp_size=2, moe_ep_size=1, gemm_quant_mode=override)
+        return core_models.get_model(str(folder), cfg, "sglang")
+
+    return build
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize(
+    "moe, exclusion",
+    [
+        (False, "model.layers.*.self_attn.q_norm"),
+        (False, "model.layers.*.linear_attn.conv1d"),
+        (False, "model.layers.*.mlp.gate"),
+        (False, "model.visual.blocks.*.mlp.*"),
+        (True, "model.layers.*.mlp.shared_expert_gate"),
+        (True, "model.visual.blocks.*.mlp.*"),
+    ],
+)
+def test_qwen_auxiliary_exclusions_preserve_fp8_matrices(qwen_precision_model, phase, moe, exclusion):
+    baseline = qwen_precision_model(moe=moe)
+    candidate = qwen_precision_model([exclusion], moe=moe)
+    assert [op._spec_json() for op in getattr(candidate, f"{phase}_ops")] == [
+        op._spec_json() for op in getattr(baseline, f"{phase}_ops")
+    ]
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize(
+    "moe, path, suffixes",
+    [
+        (False, "linear_attn.in_proj_ba", ("gdn_in_proj_ba_gemm",)),
+        (False, "mlp.*", ("gate_ffn1_gemm", "ffn2_gemm")),
+        (True, "mlp.shared_expert.*", ("shared_gate_up_gemm", "shared_down_gemm")),
+    ],
+)
+def test_qwen_matrix_exclusions_preserve_bf16_and_weight_sizes(qwen_precision_model, phase, moe, path, suffixes):
+    baseline = qwen_precision_model(moe=moe)
+    candidate = qwen_precision_model([f"model.language_model.layers.*.{path}"], moe=moe)
+    before = {op._name: op for op in _flatten_ops(getattr(baseline, f"{phase}_ops"))}
+    weight_delta = 0
+    for op in _flatten_ops(getattr(candidate, f"{phase}_ops")):
+        original = before[op._name]
+        if op._name.endswith(suffixes):
+            assert original._quant_mode == common.GEMMQuantMode.fp8_block
+            assert op._quant_mode == common.GEMMQuantMode.bfloat16
+            assert op.get_weights() == 2 * original.get_weights()
+            weight_delta += original.get_weights()
+        else:
+            assert op._spec_json() == original._spec_json()
+    assert weight_delta > 0
+    if phase == "context":
+        assert candidate.get_resident_weights_bytes() - baseline.get_resident_weights_bytes() == weight_delta
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("moe", [False, True])
+def test_qwen_explicit_gemm_override_remains_authoritative(qwen_precision_model, phase, moe):
+    baseline = qwen_precision_model(override=common.GEMMQuantMode.fp8_block, moe=moe)
+    candidate = qwen_precision_model(
+        ["model.layers.*.linear_attn*", "model.layers.*.mlp.*"],
+        override=common.GEMMQuantMode.fp8_block,
+        moe=moe,
+    )
+    assert [op._spec_json() for op in getattr(candidate, f"{phase}_ops")] == [
+        op._spec_json() for op in getattr(baseline, f"{phase}_ops")
+    ]
