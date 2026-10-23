@@ -86,6 +86,7 @@ def _qwen35_mixed_precision_gemm_modes(
         # Keep the existing category-level policy, but match actual decoder
         # matrices. In particular, mlp.gate is not mlp.gate_proj, and vision
         # MLPs must not reclassify the text decoder's FFN.
+        unanchored = pattern if pattern.startswith("*.") else None
         if ".layers." in pattern:
             pattern = pattern.split(".layers.", 1)[1].partition(".")[2] or "*"
         elif pattern.startswith("layers."):
@@ -94,7 +95,7 @@ def _qwen35_mixed_precision_gemm_modes(
             pattern = pattern[2:]
         # Match parent modules too, preserving whole-block exclusions.
         while module:
-            if fnmatchcase(module, pattern):
+            if fnmatchcase(module, pattern) or (unanchored is not None and fnmatchcase(module, unanchored)):
                 return True
             module = module.rpartition(".")[0]
         return False

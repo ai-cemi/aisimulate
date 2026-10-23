@@ -636,6 +636,10 @@ def test_qwen_auxiliary_exclusions_preserve_fp8_matrices(qwen_precision_model, p
         (False, "model.language_model.layers.*.mlp.*", ("gate_ffn1_gemm", "ffn2_gemm")),
         (True, "model.language_model.layers.*.mlp.shared_expert.*", ("shared_gate_up_gemm", "shared_down_gemm")),
         (True, "model.layers.*.mlp", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (False, "*.gate_proj", ("gate_ffn1_gemm", "ffn2_gemm")),
+        (True, "*.gate_proj", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (True, "*.shared_expert", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (False, "*.mlp", ("gate_ffn1_gemm", "ffn2_gemm")),
         *[
             (
                 False,
