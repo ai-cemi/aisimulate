@@ -46,6 +46,8 @@ illustrate the output format. Captured detail examples are simulation results, n
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
 | `--capture-per-request` | flag | `false` | Write per-request prediction records to `requests.jsonl`. |
+| `--capture-telemetry` | flag | `false` | Write virtual-time replay telemetry samples to `telemetry.jsonl`. The selected stack must produce the samples: the built-in `engine` stack provides them for offline native replay and rejects AFD, analytical EPD and `--online`, and the run fails when a stack returns none. Per-request records do not change; worker-seconds and `gpu_hours` can differ in the last float bits. |
+| `--telemetry-interval-ms MS` | positive finite number | `1000` | Virtual-time interval between telemetry samples. Valid only with `--capture-telemetry`. |
 | `--detail` | comma-separated selectors | omitted | Add `summary`, `memory`, `time`, `energy`, `source`, or `all`. See [prediction details](#prediction-details). |
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
 
@@ -183,6 +185,7 @@ unavailable; their summary fields are explicit nulls where unsupported.
 ├── resource-runtime.json
 ├── execution-events.jsonl         # when execution produced checkpoints
 ├── requests.jsonl                 # only with --capture-per-request
+├── telemetry.jsonl                # only with --capture-telemetry
 ├── afd-replay-spec.json           # only for AFD
 └── afd-qualification.json         # only for AFD
 ```
@@ -192,6 +195,28 @@ unavailable; their summary fields are explicit nulls where unsupported.
   `host_loop` add `scheduler_received_ms`, `selected_ms` and `prefill_complete_ms` to each
   record; a worker with `frontend` or `host_profile` also adds `frontend_ready_ms`, and a native
   encoder pool adds `encoder_ready_ms`.
+- `telemetry.jsonl` contains one replay telemetry snapshot per line, in sample order, when
+  explicitly enabled. The samples are not copied into `prediction.json`. Each line has
+  `sample_ordinal`, `kind` (`baseline` at the first settled timestamp, `periodic` for each
+  complete interval, `final` for a nonempty tail), `interval_start_ms` and `sampled_at_ms`
+  on the replay virtual clock, and:
+  - `traffic`: interval counters and means (`arriving_requests`, `completed_requests`,
+    `avg_isl`, `avg_osl`, `avg_ttft_ms`, `avg_itl_ms`, router KV hit rate, accept length).
+  - `prefill_scheduler_metrics`, `decode_scheduler_metrics`: point-in-time rows for each live
+    worker rank (`active_blocks`, `inactive_blocks`, `total_blocks`, cache usage, grouped-cache
+    bytes when present, `running_requests`, `waiting_requests`). Aggregated replay reports its
+    single role in the decode fields. These gauges show the rank's scheduler state after its
+    latest command (such as a submit) or pass completion; a pass start does not refresh them.
+    Thus a request admitted when a pass starts can count as waiting until that pass completes
+    (as in vLLM, which makes its scheduler stats after each step) or the next command reaches
+    the rank.
+  - `prefill_interval_metrics`, `decode_interval_metrics`: interval counters
+    (`cache_hit_tokens`, `cache_total_tokens`, `preemptions`).
+  - Router pending-request counts and the active, starting and draining worker IDs.
+
+  Gauges are sampled after a virtual timestamp settles. A sample does not change per-request
+  records. Each sample splits the integration of time-integrated totals (worker-seconds,
+  `gpu_hours`), so these can differ in the last float bits.
 - `resource-plan.json` describes preflight refusal, with null for unavailable host, budget,
   or workload estimates. `resource-runtime.json` records the effective budget and supervision
   outcome. `execution-events.jsonl` retains complete checkpoints after interruption; see
@@ -217,7 +242,7 @@ Without `--overwrite`, the CLI rejects an existing nonempty output directory. Wi
 replaces only the known output files listed below and preserves unrelated files.
 
 Specifically, overwrite may replace `prediction.json`, `recommendation.json`, `recommendation.csv`,
-`requests.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
+`requests.jsonl`, `telemetry.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
 `afd-replay-spec.json`, `afd-qualification.json`, and numbered `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
 configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or

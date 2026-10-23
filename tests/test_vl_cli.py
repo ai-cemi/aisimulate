@@ -731,6 +731,21 @@ def test_native_encoder_pool_gates_the_language_worker(tmp_path, capsys):
         assert record["arrival_time_ms"] < record["encoder_ready_ms"] <= record["scheduler_received_ms"]
 
 
+def test_native_encoder_pool_writes_replay_telemetry(tmp_path):
+    # Unlike the analytical overlay, the native pool is on the replay clock, so its samples
+    # describe the same run as prediction.json.
+    table = tmp_path / "table.json"
+    table.write_text(json.dumps(_host_table()))
+    path = tmp_path / "predict.yaml"
+    path.write_text(yaml.safe_dump(_native_epd_prediction(table)))
+    output = tmp_path / "out"
+    assert main(["predict", "-c", str(path), "--output-dir", str(output), "--capture-telemetry"]) == 0
+    samples = [json.loads(line) for line in (output / "telemetry.jsonl").read_text().splitlines()]
+    assert samples[0]["kind"] == "baseline"
+    assert sum(sample["traffic"]["completed_requests"] for sample in samples) == 4
+    assert "telemetry" not in json.loads((output / "prediction.json").read_text())
+
+
 @pytest.mark.parametrize(
     "kind,fragment",
     [

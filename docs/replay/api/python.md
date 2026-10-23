@@ -77,9 +77,13 @@ comparing latency or throughput across runs.
 `ReplayOutputRequirements` defaults to summary output. It can request a raw
 report, per-request capture, memory diagnostics or performance diagnostics.
 These controls retain additional evidence without changing the workload.
-Telemetry fields are part of the shared contract, but the built-in Engine
-JSON runner currently rejects `capture_telemetry=True`; the native Rust
-observer is a separate interface. Analytical EPD does not provide raw native
+With `capture_telemetry=True`, the built-in Engine JSON runner samples the
+native Rust telemetry observer every `telemetry_sample_interval_ms` of virtual
+time and returns the samples as the `metadata["native_report"]["telemetry"]`
+list, in sample order. This requires
+offline native replay; AFD, analytical EPD and online execution reject it.
+`aisimulate predict --capture-telemetry` writes these samples to
+`telemetry.jsonl`. Analytical EPD does not provide raw native
 or per-request EPD reports. Large capture can require substantial memory.
 
 ## Lifecycle and errors

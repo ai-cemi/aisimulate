@@ -919,6 +919,66 @@ fn telemetry_samples_router_queues_before_a_coincident_scale_up() {
     assert_eq!(coincident.active_decode_ids, vec![0]);
 }
 
+/// The scheduler gauges are refreshed after each completed forward pass (and
+/// each command), not during a pass, so a prompt that finishes prefill in one
+/// pass never shows as running. Split one prompt into four prefill chunks with
+/// fixed 2 ms passes (ending at 2, 4, 6 and 8 ms) and sample at 3 ms, after
+/// the first chunk ends while the second runs.
+#[test]
+fn telemetry_reports_a_chunked_prefill_in_the_prefill_rows() {
+    use crate::engine::TimingModelConfig;
+
+    let mut config = forced_chunked_handoff_config(EngineType::Vllm);
+    for args in [&mut config.prefill_args, &mut config.decode_args] {
+        args.speedup_ratio = 1.0;
+        args.decode_speedup_ratio = 1.0;
+        args.timing_model = TimingModelConfig::Fixed {
+            prefill_ms: 2.0,
+            decode_ms: 1.0,
+        };
+    }
+    config.decode_args.num_gpu_blocks = 512;
+    let pending = VecDeque::from([request(9_305, 256, 4, 0.0)]);
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let observer = CaptureTelemetryObserver {
+        samples: Arc::clone(&samples),
+    };
+    DisaggRuntime::from_requests(&config, None, None, pending, ReplayMode::Trace)
+        .unwrap()
+        .with_telemetry_observer(3.0, Box::new(observer))
+        .run()
+        .unwrap();
+
+    let samples = samples.lock().unwrap();
+    let mid_prefill = samples
+        .iter()
+        .find(|sample| sample.sampled_at_ms == 3.0)
+        .expect("telemetry must sample between the first and second prefill chunk");
+    assert_eq!(mid_prefill.kind, ReplayTelemetrySampleKind::Periodic);
+    let prefill = &mid_prefill.prefill_scheduler_metrics[0];
+    let decode = &mid_prefill.decode_scheduler_metrics[0];
+    // The two roles have different capacities, so a swap or a copy fails here.
+    assert_eq!(prefill.total_blocks, 256);
+    assert_eq!(decode.total_blocks, 512);
+    assert_eq!(prefill.running_requests, 1);
+    assert_eq!(prefill.waiting_requests, 0);
+    assert_eq!(decode.running_requests, 0);
+    assert_eq!(decode.waiting_requests, 0);
+
+    // At 9 ms the last chunk (ending at 8 ms) is done and decode owns the
+    // request. A decode pass also ends at 9 ms, so count the request in decode
+    // whether that completion is applied before or after the sample.
+    let after_prefill = samples
+        .iter()
+        .find(|sample| sample.sampled_at_ms == 9.0)
+        .expect("telemetry must sample after the last prefill chunk");
+    let prefill = &after_prefill.prefill_scheduler_metrics[0];
+    let decode = &after_prefill.decode_scheduler_metrics[0];
+    assert_eq!(prefill.running_requests, 0);
+    assert_eq!(prefill.waiting_requests, 0);
+    assert_eq!(decode.running_requests + decode.waiting_requests, 1);
+}
+
 #[test]
 fn telemetry_heartbeat_does_not_keep_a_deadlocked_disagg_replay_alive() {
     let config = disagg_config();

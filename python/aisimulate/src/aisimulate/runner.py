@@ -474,8 +474,15 @@ class EngineReplayRunner:
             spec.backend_deployment.deployment_mode in {"afd", "afd+pd"} or spec.backend_deployment.encoder is not None
         ):
             raise InvalidRunnerError("canonical determinism requires native text replay")
-        if output_requirements.capture_telemetry:
-            raise InvalidRunnerError("EngineReplayRunner's JSON runtime does not yet expose replay telemetry")
+        if output_requirements.capture_telemetry and (
+            spec.execution_mode != "offline"
+            or spec.backend_deployment.deployment_mode in {"afd", "afd+pd"}
+            or (spec.backend_deployment.encoder is not None and spec.backend_deployment.encoder.mode == "analytical")
+        ):
+            raise InvalidRunnerError(
+                "replay telemetry requires offline native replay; AFD, analytical EPD and online "
+                "execution do not produce replay telemetry samples"
+            )
         if spec.workload.get("source_type") is not None and "length_sampler" in spec.workload:
             raise ValueError("length_sampler requires materialized direct synthetic replay without source_type")
         self.capabilities.require_compatible(spec)
@@ -574,19 +581,21 @@ class EngineReplayRunner:
                 execution_spec = {"spec": execution_spec}
             execution_spec["spec"]["encoder"] = _native_encoder_spec(encoder, spec.backend_deployment)
         if output_requirements.capture_performance_diagnostics:
-            if "spec" not in execution_spec:
-                execution_spec = {"spec": execution_spec}
+            execution_spec = _configured(execution_spec)
             execution_spec["capture_performance_diagnostics"] = True
         if self.determinism != "random":
-            if "spec" not in execution_spec:
-                execution_spec = {"spec": execution_spec}
+            execution_spec = _configured(execution_spec)
             execution_spec["determinism"] = self.determinism
         if self.trace_graph_cache and "traffic" in execution_spec:
             execution_spec["traffic"]["trace_graph_cache"] = True
         if spec.backend_deployment.tokenization is not None:
-            if "spec" not in execution_spec:
-                execution_spec = {"spec": execution_spec}
+            execution_spec = _configured(execution_spec)
             execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
+        if output_requirements.capture_telemetry:
+            execution_spec = _configured(execution_spec)
+            execution_spec["telemetry"] = {
+                "sample_interval_ms": float(output_requirements.telemetry_sample_interval_ms),
+            }
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -637,6 +646,7 @@ class EngineReplayRunner:
             include_native_report=(
                 output_requirements.include_raw_report
                 or output_requirements.capture_per_request
+                or output_requirements.capture_telemetry
                 or output_requirements.capture_memory_diagnostics
                 or output_requirements.capture_performance_diagnostics
             ),
@@ -1019,6 +1029,12 @@ def _run_afd_replay(
     metrics.update(normalize_power_summary(metrics))
     metadata["power"] = power_metadata(metrics)
     return ReplayReport(metrics=metrics, metadata=metadata)
+
+
+def _configured(execution_spec: dict[str, Any]) -> dict[str, Any]:
+    """Return the configured execution payload, wrapping a legacy bare ReplaySpec once."""
+
+    return execution_spec if "spec" in execution_spec else {"spec": execution_spec}
 
 
 def _materialize_engine_execution_spec(

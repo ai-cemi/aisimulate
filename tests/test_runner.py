@@ -1379,18 +1379,78 @@ def test_runner_preserves_withheld_power_without_raw_report():
     assert report.metadata["power"]["publication_status"] == "withheld"
 
 
-def test_engine_runner_rejects_unsupported_telemetry_before_runtime_invocation():
-    runtime = RecordingRuntime()
+class TelemetryRecordingRuntime(RecordingRuntime):
+    def run_replay_json(self, execution_spec_json):
+        payload = json.loads(super().run_replay_json(execution_spec_json))
+        if "telemetry" in self.execution_spec:
+            payload["telemetry"] = [{"sample_ordinal": 0, "kind": "baseline"}]
+        return json.dumps(payload)
+
+
+@pytest.mark.parametrize("interval_ms", [1000.0, 250.5])
+def test_engine_runner_requests_native_telemetry_in_the_execution_payload(interval_ms):
+    runtime = TelemetryRecordingRuntime()
     runner = EngineReplayRunnerFactory(runtime=runtime).create(worker_id=7)
 
-    with pytest.raises(
-        InvalidRunnerError,
-        match="JSON runtime does not yet expose replay telemetry",
-    ):
-        runner.run(
-            _spec(),
-            output_requirements=ReplayOutputRequirements(capture_telemetry=True),
-        )
+    report = runner.run(
+        _spec(),
+        output_requirements=ReplayOutputRequirements(
+            capture_telemetry=True,
+            telemetry_sample_interval_ms=interval_ms,
+        ),
+    )
+
+    assert runtime.execution_spec["telemetry"] == {"sample_interval_ms": interval_ms}
+    assert runtime.execution_spec["spec"]["record_per_request"] is False
+    assert report.metadata["native_report"]["telemetry"] == [{"sample_ordinal": 0, "kind": "baseline"}]
+    assert "telemetry" not in report.metrics
+
+
+def test_engine_runner_without_telemetry_keeps_the_unwrapped_execution_payload():
+    runtime = TelemetryRecordingRuntime()
+    report = EngineReplayRunnerFactory(runtime=runtime).create(worker_id=7).run(_spec())
+
+    assert "telemetry" not in runtime.execution_spec
+    assert "spec" not in runtime.execution_spec
+    assert "native_report" not in report.metadata
+
+
+def _encoder_pool():
+    from aisimulate.sweeper.replay import EncoderPoolSpec
+
+    return EncoderPoolSpec(
+        model="test-model",
+        system="test-system",
+        backend="vllm",
+        backend_version="test",
+        tp=1,
+        batch_size=1,
+        workers=1,
+        latency_ms=50.0,
+        throughput_rps=80.0,
+        memory_gib=2.0,
+        rate_degradation=0.9,
+        visual_tokens=196,
+        image_height=448,
+        image_width=448,
+        image_count=1,
+    )
+
+
+@pytest.mark.parametrize("path", ["online", "afd", "afd+pd", "analytical_epd"])
+def test_engine_runner_rejects_telemetry_on_paths_without_native_samples(path):
+    runtime = RecordingRuntime()
+    runner = EngineReplayRunnerFactory(runtime=runtime).create(worker_id=7)
+    spec = _spec()
+    if path == "online":
+        spec = replace(spec, execution_mode="online")
+    elif path == "analytical_epd":
+        spec = replace(spec, backend_deployment=replace(spec.backend_deployment, encoder=_encoder_pool()))
+    else:
+        spec = replace(spec, backend_deployment=replace(spec.backend_deployment, deployment_mode=path))
+
+    with pytest.raises(InvalidRunnerError, match="replay telemetry requires offline native replay"):
+        runner.run(spec, output_requirements=ReplayOutputRequirements(capture_telemetry=True))
 
     assert runtime.execution_spec_json is None
 
