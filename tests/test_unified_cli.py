@@ -295,31 +295,40 @@ def test_predict_is_the_single_concrete_cli(tmp_path, monkeypatch, capsys) -> No
     assert json.loads(capsys.readouterr().out)["completed_requests"] == 1
 
 
-def _fixed_timing_prediction_yaml(tmp_path):
-    worker = {
-        "scheduler": {"max_batched_tokens": 8192, "max_sequences": 4},
-        "kv_cache": {"block_size": 16, "prefix_caching": True, "capacity": {"type": "fixed", "blocks": 256}},
-        "timing": {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 1.0},
+def _fixed_timing_prediction_yaml(tmp_path, kv_blocks=None):
+    """Write a fixed-timing prediction config with one worker per role in ``kv_blocks``."""
+    kv_blocks = kv_blocks or {"aggregated": 256}
+
+    def worker(blocks):
+        return {
+            "scheduler": {"max_batched_tokens": 8192, "max_sequences": 4},
+            "kv_cache": {"block_size": 16, "prefix_caching": True, "capacity": {"type": "fixed", "blocks": blocks}},
+            "timing": {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 1.0},
+        }
+
+    engine = {
+        "model": "example/model",
+        "hardware": "h200_sxm",
+        "backend": "vllm",
+        "context_length": 4096,
+        "workers": {role: worker(blocks) for role, blocks in kv_blocks.items()},
     }
+    if "aggregated" not in kv_blocks:
+        engine["mode"] = "disaggregated"
     path = tmp_path / "prediction.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "engine": {
-                    "model": "example/model",
-                    "hardware": "h200_sxm",
-                    "backend": "vllm",
-                    "context_length": 4096,
-                    "workers": {"aggregated": worker},
-                }
-            }
-        )
-    )
+    path.write_text(yaml.safe_dump({"engine": engine}))
     return path
 
 
-def test_predict_cli_writes_native_replay_telemetry_to_jsonl(tmp_path, capsys) -> None:
-    config_path = _fixed_timing_prediction_yaml(tmp_path)
+# Different fixed KV capacities per role, so a swap or a copy between the
+# prefill and decode rows of a sample is detectable.
+@pytest.mark.parametrize(
+    "kv_blocks",
+    [{"aggregated": 256}, {"prefill": 128, "decode": 256}],
+    ids=["aggregated", "disaggregated"],
+)
+def test_predict_cli_writes_native_replay_telemetry_to_jsonl(tmp_path, capsys, kv_blocks) -> None:
+    config_path = _fixed_timing_prediction_yaml(tmp_path, kv_blocks)
     base = ["predict", "--config", str(config_path), "--format", "json", "--capture-per-request"]
 
     assert cli.main([*base, "--output-dir", str(tmp_path / "plain")]) == 0
@@ -348,8 +357,25 @@ def test_predict_cli_writes_native_replay_telemetry_to_jsonl(tmp_path, capsys) -
     periodic = [sample for sample in samples if sample["kind"] == "periodic"]
     assert periodic
     assert all(sample["sampled_at_ms"] - sample["interval_start_ms"] == pytest.approx(50.0) for sample in periodic)
-    # Aggregated replay reports its single role in the decode rows.
-    assert samples[-1]["decode_scheduler_metrics"][0]["total_blocks"] == 256
+    if "aggregated" in kv_blocks:
+        # Aggregated replay reports its single role in the decode rows.
+        assert samples[-1]["decode_scheduler_metrics"][0]["total_blocks"] == 256
+    else:
+        # Each role fills its own rows, and both roles do work during the run.
+        prefill = [sample["prefill_scheduler_metrics"][0] for sample in samples]
+        decode = [sample["decode_scheduler_metrics"][0] for sample in samples]
+        assert all(row["total_blocks"] == kv_blocks["prefill"] for row in prefill)
+        assert all(row["total_blocks"] == kv_blocks["decode"] for row in decode)
+        # The scheduler gauges are refreshed after each completed forward pass,
+        # not during one. A prompt that finishes prefill in one pass has already
+        # left the prefill running set by then, so prefill running stays 0 (the
+        # Rust disagg tests cover it with a chunked prefill). Prefill work shows
+        # as held KV blocks instead: the decode KV fits only 3 of the 10
+        # concurrent requests, so finished prefills keep their blocks on the
+        # prefill worker until decode takes them. The baseline precedes any pass.
+        assert prefill[0]["active_blocks"] == 0
+        assert any(row["active_blocks"] > 0 for row in prefill)
+        assert any(row["running_requests"] > 0 for row in decode)
     requests = (tmp_path / "observed" / "requests.jsonl").read_text().splitlines()
     assert sum(sample["traffic"]["arriving_requests"] for sample in samples) == len(requests)
     assert sum(sample["traffic"]["completed_requests"] for sample in samples) == len(requests)
