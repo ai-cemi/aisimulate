@@ -612,6 +612,12 @@ def qwen_precision_model(tmp_path):
 @pytest.mark.parametrize(
     "moe, exclusion",
     [
+        (False, r"re:.*self_attn\.q_norm$"),
+        (False, r"re:^model\.visual\.blocks\..*\.mlp\..*"),
+        (False, r"re:^model\.layers\.9999\.mlp\..*"),
+        (False, r"re:^model\.layers\.\D+\.mlp\..*"),
+        (False, "model.visual.layers.*.mlp.*"),
+        (False, "mtp.layers.0*"),
         (False, "model.layers.*.self_attn.q_norm"),
         (False, "model.layers.*.linear_attn.conv1d"),
         (False, "model.layers.*.mlp.gate"),
@@ -636,6 +642,10 @@ def test_qwen_auxiliary_exclusions_preserve_fp8_matrices(qwen_precision_model, p
         (False, "model.language_model.layers.*.mlp.*", ("gate_ffn1_gemm", "ffn2_gemm")),
         (True, "model.language_model.layers.*.mlp.shared_expert.*", ("shared_gate_up_gemm", "shared_down_gemm")),
         (True, "model.layers.*.mlp", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (False, r"re:^model\.layers\.1\.mlp\.(gate|up|down)_proj$", ("gate_ffn1_gemm", "ffn2_gemm")),
+        (True, r"re:^model\.language_model\.layers\.1\.mlp$", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (False, r"re:.*linear_attn\.in_proj_ba$", ("gdn_in_proj_ba_gemm",)),
+        (False, r"re:.*self_attn\..*", ("gdn_in_proj_gemm", "gdn_out_proj_gemm", "qkv_gemm", "proj_gemm")),
         (False, "*.gate_proj", ("gate_ffn1_gemm", "ffn2_gemm")),
         (True, "*.gate_proj", ("shared_gate_up_gemm", "shared_down_gemm")),
         (True, "*.shared_expert", ("shared_gate_up_gemm", "shared_down_gemm")),
@@ -654,7 +664,7 @@ def test_qwen_auxiliary_exclusions_preserve_fp8_matrices(qwen_precision_model, p
                     "ffn2_gemm",
                 ),
             )
-            for exclusion in ("model.layers.*", "layers.*")
+            for exclusion in ("model.layers.*", "layers.*", r"re:^model\.layers\.1$", r"re:^model$")
         ],
     ],
 )
@@ -682,10 +692,51 @@ def test_qwen_matrix_exclusions_preserve_bf16_and_weight_sizes(qwen_precision_mo
 def test_qwen_explicit_gemm_override_remains_authoritative(qwen_precision_model, phase, moe):
     baseline = qwen_precision_model(override=common.GEMMQuantMode.fp8_block, moe=moe)
     candidate = qwen_precision_model(
-        ["model.layers.*.linear_attn*", "model.layers.*.mlp.*"],
+        ["model.layers.*.linear_attn*", "model.layers.*.mlp.*", r"re:.*linear_attn\..*", r"re:.*mlp\..*"],
         override=common.GEMMQuantMode.fp8_block,
         moe=moe,
     )
     assert [op._spec_json() for op in getattr(candidate, f"{phase}_ops")] == [
         op._spec_json() for op in getattr(baseline, f"{phase}_ops")
     ]
+
+
+@pytest.mark.parametrize(
+    "source", ["modules_to_not_convert", "exclude_modules", "ignore", "text_config", "hf_quant_config"]
+)
+def test_qwen_regex_exclusion_sources_and_explicit_metadata(source):
+    from aisimulate_core.sdk.models.qwen35 import _qwen35_mixed_precision_gemm_modes
+
+    quant = {"ignore": [r"re:^model\.layers\.1\.linear_attn\.in_proj_ba$"]}
+    raw = {"num_hidden_layers": 2}
+    if source == "hf_quant_config":
+        raw[source] = {"quantization": quant}
+    elif source == "text_config":
+        raw = {
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"num_hidden_layers": 2, "quantization_config": quant},
+        }
+    else:
+        quant[source] = quant.pop("ignore")
+        raw["quantization_config"] = quant
+    fp8 = common.GEMMQuantMode.fp8_block
+
+    def resolve():
+        return _qwen35_mixed_precision_gemm_modes(raw, fp8, allow_checkpoint_split=True)
+
+    assert resolve() == (fp8, fp8, fp8, common.GEMMQuantMode.bfloat16)
+    quant["quantized_layers"] = {"model.layers.1.linear_attn.in_proj_ba": {"quant_algo": "fp8"}}
+    assert resolve() == (fp8, fp8, fp8, common.GEMMQuantMode.fp8_static)
+
+
+def test_qwen_invalid_regex_reports_configuration_error():
+    from aisimulate_core.sdk.models.qwen35 import _qwen35_mixed_precision_gemm_modes
+
+    raw = {"quantization_config": {"ignore": ["re:["]}}
+    with pytest.raises(ValueError, match="Invalid Qwen quantization exclusion"):
+        _qwen35_mixed_precision_gemm_modes(raw, common.GEMMQuantMode.fp8_block, allow_checkpoint_split=True)
+    # An explicit override bypasses checkpoint interpretation entirely.
+    assert (
+        _qwen35_mixed_precision_gemm_modes(raw, common.GEMMQuantMode.fp8_block, allow_checkpoint_split=False)
+        == (common.GEMMQuantMode.fp8_block,) * 4
+    )

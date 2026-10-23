@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from fnmatch import fnmatchcase
 
 import aisimulate_core.sdk.operations as ops
@@ -80,14 +81,37 @@ def _qwen35_mixed_precision_gemm_modes(
                 modes[category] = mode
                 explicit.add(category)
 
-    exclusions = tuple(str(pattern).lower() for pattern in quant_exclude_patterns(raw_config))
+    exclusions = []
+    for pattern in quant_exclude_patterns(raw_config):
+        pattern = str(pattern)
+        if pattern.startswith("re:"):
+            try:
+                exclusions.append(re.compile(pattern[3:]))
+            except re.error as error:
+                raise ValueError(f"Invalid Qwen quantization exclusion {pattern!r}: {error}") from error
+        else:
+            exclusions.append(pattern.lower())
+    text_config = raw_config.get("text_config") or raw_config
+    num_layers = int(text_config.get("num_hidden_layers", 1))
 
     def covers(pattern, module):
         # Keep the existing category-level policy, but match actual decoder
         # matrices. In particular, mlp.gate is not mlp.gate_proj, and vision
         # MLPs must not reclassify the text decoder's FFN.
+        if isinstance(pattern, re.Pattern):
+            # Preserve regex syntax/case and check real layer indices under both
+            # text-only and multimodal paths. Any match retains the existing
+            # category-wide precision policy; this is not per-layer splitting.
+            for layer in range(num_layers):
+                for prefix in ("model.layers", "model.language_model.layers"):
+                    path = f"{prefix}.{layer}.{module}"
+                    while path:
+                        if pattern.match(path):
+                            return True
+                        path = path.rpartition(".")[0]
+            return False
         unanchored = pattern if pattern.startswith("*.") else None
-        if ".layers." in pattern:
+        if pattern.startswith(("model.layers.", "model.language_model.layers.", "language_model.layers.", "*.layers.")):
             pattern = pattern.split(".layers.", 1)[1].partition(".")[2] or "*"
         elif pattern.startswith("layers."):
             pattern = pattern[len("layers.") :].partition(".")[2] or "*"
