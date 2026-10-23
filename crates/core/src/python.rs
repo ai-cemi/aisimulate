@@ -2188,11 +2188,13 @@ fn run_with_input(
     } else {
         (replayer.run()?, None)
     };
+    // `run` consumed the replayer and its boxed observer, so this is the sole
+    // owner: take the vector out without a lock.
     let telemetry = samples
         .map(|samples| {
-            samples
-                .lock()
-                .map(|mut samples| std::mem::take(&mut *samples))
+            Arc::try_unwrap(samples)
+                .expect("telemetry observer was dropped with the replayer")
+                .into_inner()
                 .map_err(|_| {
                     crate::replay::ReplayError::Telemetry(
                         "replay telemetry collector lock was poisoned".to_string(),
