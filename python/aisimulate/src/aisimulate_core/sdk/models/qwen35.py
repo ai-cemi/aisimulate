@@ -87,13 +87,17 @@ def _qwen35_mixed_precision_gemm_modes(
         # matrices. In particular, mlp.gate is not mlp.gate_proj, and vision
         # MLPs must not reclassify the text decoder's FFN.
         if ".layers." in pattern:
-            pattern = pattern.split(".layers.", 1)[1].partition(".")[2]
+            pattern = pattern.split(".layers.", 1)[1].partition(".")[2] or "*"
         elif pattern.startswith("layers."):
-            pattern = pattern[len("layers.") :].partition(".")[2]
+            pattern = pattern[len("layers.") :].partition(".")[2] or "*"
         elif pattern.startswith("*."):
             pattern = pattern[2:]
         # Match parent modules too, preserving whole-block exclusions.
-        return any(fnmatchcase(parent, pattern) for parent in (module, module.rsplit(".", 1)[0]))
+        while module:
+            if fnmatchcase(module, pattern):
+                return True
+            module = module.rpartition(".")[0]
+        return False
 
     matrices = {
         "projection": (

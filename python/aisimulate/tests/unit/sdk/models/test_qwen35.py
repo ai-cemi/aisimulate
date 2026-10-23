@@ -630,16 +630,33 @@ def test_qwen_auxiliary_exclusions_preserve_fp8_matrices(qwen_precision_model, p
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize(
-    "moe, path, suffixes",
+    "moe, exclusion, suffixes",
     [
-        (False, "linear_attn.in_proj_ba", ("gdn_in_proj_ba_gemm",)),
-        (False, "mlp.*", ("gate_ffn1_gemm", "ffn2_gemm")),
-        (True, "mlp.shared_expert.*", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (False, "model.language_model.layers.*.linear_attn.in_proj_ba", ("gdn_in_proj_ba_gemm",)),
+        (False, "model.language_model.layers.*.mlp.*", ("gate_ffn1_gemm", "ffn2_gemm")),
+        (True, "model.language_model.layers.*.mlp.shared_expert.*", ("shared_gate_up_gemm", "shared_down_gemm")),
+        (True, "model.layers.*.mlp", ("shared_gate_up_gemm", "shared_down_gemm")),
+        *[
+            (
+                False,
+                exclusion,
+                (
+                    "gdn_in_proj_gemm",
+                    "gdn_in_proj_ba_gemm",
+                    "gdn_out_proj_gemm",
+                    "qkv_gemm",
+                    "proj_gemm",
+                    "gate_ffn1_gemm",
+                    "ffn2_gemm",
+                ),
+            )
+            for exclusion in ("model.layers.*", "layers.*")
+        ],
     ],
 )
-def test_qwen_matrix_exclusions_preserve_bf16_and_weight_sizes(qwen_precision_model, phase, moe, path, suffixes):
+def test_qwen_matrix_exclusions_preserve_bf16_and_weight_sizes(qwen_precision_model, phase, moe, exclusion, suffixes):
     baseline = qwen_precision_model(moe=moe)
-    candidate = qwen_precision_model([f"model.language_model.layers.*.{path}"], moe=moe)
+    candidate = qwen_precision_model([exclusion], moe=moe)
     before = {op._name: op for op in _flatten_ops(getattr(baseline, f"{phase}_ops"))}
     weight_delta = 0
     for op in _flatten_ops(getattr(candidate, f"{phase}_ops")):
