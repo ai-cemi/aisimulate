@@ -740,3 +740,41 @@ def test_qwen_invalid_regex_reports_configuration_error():
         _qwen35_mixed_precision_gemm_modes(raw, common.GEMMQuantMode.fp8_block, allow_checkpoint_split=False)
         == (common.GEMMQuantMode.fp8_block,) * 4
     )
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize(
+    "prefix, regex_prefix",
+    [
+        ("model.layers", r"model\.layers"),
+        ("model.language_model.layers", r"model\.language_model\.layers"),
+        ("language_model.layers", r"language_model\.layers"),
+        ("layers", "layers"),
+        ("*.layers", r".*\.layers"),
+    ],
+)
+@pytest.mark.parametrize(
+    "selector, regex_selector, matches",
+    [
+        ("1", "1", True),
+        ("*", r"\d+", True),
+        ("[01]", "[01]", True),
+        ("9999", "9999", False),
+        ("999?", "999[0-9]", False),
+        ("01", "01", False),
+    ],
+)
+def test_qwen_glob_and_regex_layer_selectors_agree(
+    qwen_precision_model, phase, prefix, regex_prefix, selector, regex_selector, matches
+):
+    expected = qwen_precision_model(["linear_attn.in_proj_ba"] if matches else [])
+    patterns = (
+        f"{prefix}.{selector}.linear_attn.in_proj_ba",
+        rf"re:^{regex_prefix}\.{regex_selector}\.linear_attn\.in_proj_ba$",
+    )
+    for pattern in patterns:
+        candidate = qwen_precision_model([pattern])
+        assert [op._spec_json() for op in getattr(candidate, f"{phase}_ops")] == [
+            op._spec_json() for op in getattr(expected, f"{phase}_ops")
+        ], pattern
+        assert candidate.get_resident_weights_bytes() == expected.get_resident_weights_bytes(), pattern

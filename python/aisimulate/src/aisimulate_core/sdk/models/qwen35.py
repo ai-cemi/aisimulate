@@ -93,6 +93,7 @@ def _qwen35_mixed_precision_gemm_modes(
             exclusions.append(pattern.lower())
     text_config = raw_config.get("text_config") or raw_config
     num_layers = int(text_config.get("num_hidden_layers", 1))
+    layer_prefixes = ("model.layers", "model.language_model.layers", "language_model.layers", "layers")
 
     def covers(pattern, module):
         # Keep the existing category-level policy, but match actual decoder
@@ -103,7 +104,7 @@ def _qwen35_mixed_precision_gemm_modes(
             # text-only and multimodal paths. Any match retains the existing
             # category-wide precision policy; this is not per-layer splitting.
             for layer in range(num_layers):
-                for prefix in ("model.layers", "model.language_model.layers"):
+                for prefix in layer_prefixes:
                     path = f"{prefix}.{layer}.{module}"
                     while path:
                         if pattern.match(path):
@@ -111,10 +112,12 @@ def _qwen35_mixed_precision_gemm_modes(
                         path = path.rpartition(".")[0]
             return False
         unanchored = pattern if pattern.startswith("*.") else None
-        if pattern.startswith(("model.layers.", "model.language_model.layers.", "language_model.layers.", "*.layers.")):
-            pattern = pattern.split(".layers.", 1)[1].partition(".")[2] or "*"
-        elif pattern.startswith("layers."):
-            pattern = pattern[len("layers.") :].partition(".")[2] or "*"
+        prefix = next((p for p in (*layer_prefixes, "*.layers") if pattern.startswith(p + ".")), None)
+        if prefix is not None:
+            selector, _, suffix = pattern[len(prefix) + 1 :].partition(".")
+            if not any(fnmatchcase(str(layer), selector) for layer in range(num_layers)):
+                return False
+            pattern = suffix or "*"
         elif pattern.startswith("*."):
             pattern = pattern[2:]
         # Match parent modules too, preserving whole-block exclusions.
